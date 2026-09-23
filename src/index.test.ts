@@ -13,6 +13,7 @@ Array [
   "SignTypedDataVersion",
   "TYPED_MESSAGE_SCHEMA",
   "TypedDataUtils",
+  "compileTypedDataPlan",
   "typedSignatureHash",
   "signTypedData",
   "recoverTypedSignature",
