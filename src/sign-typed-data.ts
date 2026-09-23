@@ -255,33 +255,135 @@ function reallyStrangeAddressToBytes(address: string): Uint8Array {
 }
 
 /**
+ * The encoded representation of a single field: the ABI type of the encoded
+ * value and the value itself.
+ */
+type EncodedField = [
+  type: string,
+  value: bigint | Buffer | boolean | string | Uint8Array,
+];
+
+/**
+ * The value of a single field, as encoded by the field encoder.
+ */
+type EncodedFieldValue = EncodedField[1];
+
+/**
+ * A precompiled description of a single field. The descriptor is immutable;
+ * it contains schema information only and never holds message values.
+ *
+ * @property name - The name of the field.
+ * @property type - The declared Solidity-like type of the field.
+ * @property structType - The name of the referenced struct, if the field is a
+ * struct (or an array of structs).
+ * @property array - Whether the field is an array.
+ * @property arrayBaseType - The declared type of the array items, if the field
+ * is an array.
+ */
+type FieldDescriptor = {
+  name: string;
+  type: string;
+  structType?: string;
+  array: boolean;
+  arrayBaseType?: string;
+};
+
+/**
+ * A precompiled description of a struct type.
+ *
+ * @property fields - The descriptors of the struct's declared fields.
+ * @property encodeType - The `encodeType` string of the struct.
+ * @property typeHash - The keccak256 hash of the `encodeType` string.
+ */
+type StructDescriptor = {
+  fields: FieldDescriptor[];
+  encodeType: string;
+  typeHash: Buffer;
+};
+
+/**
+ * The execution context used by the encoding core. This indirection lets the
+ * exact same field and struct encoding logic serve both the "direct" code path
+ * (which resolves and hashes the schema on every call) and the "plan" code
+ * path (which uses an immutable, precompiled schema).
+ *
+ * @property version - The EIP-712 version the encoding complies with.
+ * @property getStruct - Get the fields declared for a struct type.
+ * @property getStructDescriptor - Get the precompiled descriptor of a struct.
+ * @property getTypeHash - Get the type hash of a struct.
+ * @property detectCycles - Whether infinitely expanding value cycles are
+ * detected and rejected. This is enabled for compiled plans; the direct code
+ * path keeps its historical (on-demand) behaviour.
+ * @property activeStructs - Stack of object values currently being encoded,
+ * used to detect infinitely expanding value cycles. Each entry also carries
+ * the field path leading to the value.
+ * @property trace - The optional safe trace to append encoded struct entries to.
+ */
+type EncodingContext = {
+  version: SignTypedDataVersion.V3 | SignTypedDataVersion.V4;
+  getStruct: (type: string) => MessageTypeProperty[] | undefined;
+  getStructDescriptor: (type: string) => StructDescriptor;
+  getTypeHash: (type: string) => Buffer;
+  detectCycles: boolean;
+  activeStructs: Map<Record<string, unknown>, string>;
+  trace?: StructTraceEntry[];
+};
+
+/**
+ * A single entry in a {@link TypedDataTrace}. It contains only type names and
+ * hashes; no message values are ever recorded.
+ *
+ * @property type - The name of the encoded struct.
+ * @property typeHash - The hash of the encoded struct's type.
+ * @property structHash - The hash of the encoded struct.
+ */
+export type StructTraceEntry = {
+  type: string;
+  typeHash: Buffer;
+  structHash: Buffer;
+};
+
+/**
+ * The optional safe trace returned by {@link TypedDataPlan.execute}.
+ */
+export type TypedDataTrace = {
+  domainHash?: StructTraceEntry;
+  messageHash?: StructTraceEntry;
+  structs: StructTraceEntry[];
+};
+
+/**
  * Encode a single field.
  *
- * @param types - All type definitions.
+ * @param context - The encoding context.
  * @param name - The name of the field to encode.
  * @param type - The type of the field being encoded.
  * @param value - The value to encode.
- * @param version - The EIP-712 version the encoding should comply with.
+ * @param descriptor - The precompiled descriptor of the field, if available.
  * @returns Encoded representation of the field.
  */
-function encodeField(
-  types: Record<string, MessageTypeProperty[]>,
+function encodeFieldValue(
+  context: EncodingContext,
   name: string,
   type: string,
   // TODO: constrain type on `value`
   value: any,
-  version: SignTypedDataVersion.V3 | SignTypedDataVersion.V4,
-): [type: string, value: bigint | Buffer | boolean | string | Uint8Array] {
-  validateVersion(version, [SignTypedDataVersion.V3, SignTypedDataVersion.V4]);
+  descriptor?: FieldDescriptor,
+): EncodedField {
+  const { version } = context;
 
-  if (types[type] !== undefined) {
-    return [
-      'bytes32',
-      // TODO: return Buffer, remove string from return type
-      version === SignTypedDataVersion.V4 && value == null // eslint-disable-line no-eq-null
-        ? '0x0000000000000000000000000000000000000000000000000000000000000000'
-        : arrToBufArr(keccak256(encodeData(type, value, types, version))),
-    ];
+  const fieldType = descriptor?.type ?? type;
+  const isArray = descriptor?.array ?? (!descriptor && type.endsWith(']'));
+  const referencedStruct = descriptor?.structType;
+  const structName =
+    !isArray &&
+    (referencedStruct !== undefined ||
+      context.getStruct(fieldType) !== undefined)
+      ? referencedStruct ?? fieldType
+      : undefined;
+
+  if (structName !== undefined) {
+    return ['bytes32', encodeStructField(context, structName, type, value)];
   }
 
   // `function` is supported in `@metamask/abi-utils`, but not allowed by
@@ -357,9 +459,10 @@ function encodeField(
         'Arrays are unimplemented in encodeData; use V4 extension',
       );
     }
-    const parsedType = type.slice(0, type.lastIndexOf('['));
+    const parsedType =
+      descriptor?.arrayBaseType ?? type.slice(0, type.lastIndexOf('['));
     const typeValuePairs = value.map((item: any) =>
-      encodeField(types, name, parsedType, item, version),
+      encodeFieldValue(context, name, parsedType, item),
     );
     return [
       'bytes32',
@@ -375,6 +478,125 @@ function encodeField(
   }
 
   return [type, value];
+}
+
+/**
+ * Encode the value of a struct field (or an item of an array of structs).
+ *
+ * In V4, a `null` or `undefined` struct value is encoded as the 32-byte zero
+ * hash, as required by EIP-712. Non-null values are encoded recursively.
+ *
+ * @param context - The encoding context.
+ * @param structType - The name of the referenced struct.
+ * @param declaredType - The type as declared on the parent field.
+ * @param value - The value to encode.
+ * @returns The encoded struct reference.
+ */
+function encodeStructField(
+  context: EncodingContext,
+  structType: string,
+  declaredType: string,
+  value: any,
+): Buffer | string {
+  const isArray = declaredType.includes('[');
+  const nullishValue =
+    context.version === SignTypedDataVersion.V4 && value == null; // eslint-disable-line no-eq-null
+
+  // Array item structs are encoded by the array branch of the field encoder;
+  // only direct struct references are encoded here.
+  if (!isArray && nullishValue) {
+    return '0x0000000000000000000000000000000000000000000000000000000000000000';
+  }
+
+  return arrToBufArr(keccak256(encodeStruct(context, structType, value)));
+}
+
+/**
+ * Encode an object by encoding and concatenating each of its members.
+ *
+ * @param context - The encoding context.
+ * @param primaryType - The root type.
+ * @param data - The object to encode.
+ * @returns An encoded representation of an object.
+ */
+function encodeStruct(
+  context: EncodingContext,
+  primaryType: string,
+  data: Record<string, unknown>,
+): Buffer {
+  if (context.detectCycles && context.activeStructs.has(data)) {
+    const cyclePath = context.activeStructs.get(data) ?? primaryType;
+    throw new Error(
+      `Unable to encode value: Detected an infinite value cycle at "${cyclePath}". Recursive structs in the schema are supported through finite values (for example a missing or null reference), but cyclic values cannot be encoded.`,
+    );
+  }
+
+  const descriptor = context.getStructDescriptor(primaryType);
+  context.activeStructs.set(data, primaryType);
+
+  const encodedTypes = ['bytes32'];
+  const encodedValues: EncodedFieldValue[] = [context.getTypeHash(primaryType)];
+
+  try {
+    for (const field of descriptor.fields) {
+      if (
+        context.version === SignTypedDataVersion.V3 &&
+        data[field.name] === undefined
+      ) {
+        continue;
+      }
+      const [type, value] = encodeFieldValue(
+        context,
+        field.name,
+        field.type,
+        data[field.name],
+        field,
+      );
+      encodedTypes.push(type);
+      encodedValues.push(value);
+    }
+  } finally {
+    context.activeStructs.delete(data);
+  }
+
+  const encoded = arrToBufArr(encode(encodedTypes, encodedValues));
+
+  if (context.trace) {
+    const typeHash = arrToBufArr(context.getTypeHash(primaryType));
+    context.trace.push({
+      type: primaryType,
+      typeHash,
+      structHash: arrToBufArr(keccak256(encoded)),
+    });
+  }
+
+  return encoded;
+}
+
+/**
+ * Create the encoding context used by the direct ("non-plan") code path. The
+ * direct path resolves struct definitions from the given type map and computes
+ * type hashes on demand, which is the historical behaviour.
+ *
+ * @param types - Type definitions for all types included in the message.
+ * @param version - The EIP-712 version the encoding should comply with.
+ * @returns The direct encoding context.
+ */
+function createDirectContext(
+  types: Record<string, MessageTypeProperty[]>,
+  version: SignTypedDataVersion.V3 | SignTypedDataVersion.V4,
+): EncodingContext {
+  return {
+    version,
+    getStruct: (type) => types[type],
+    getStructDescriptor: (type) =>
+      ({
+        fields: types[type],
+      } as StructDescriptor),
+    getTypeHash: (type) => hashType(type, types),
+    detectCycles: false,
+    activeStructs: new Map(),
+  };
 }
 
 /**
@@ -394,27 +616,7 @@ function encodeData(
 ): Buffer {
   validateVersion(version, [SignTypedDataVersion.V3, SignTypedDataVersion.V4]);
 
-  const encodedTypes = ['bytes32'];
-  const encodedValues: (string | bigint | boolean | Uint8Array | Buffer)[] = [
-    hashType(primaryType, types),
-  ];
-
-  for (const field of types[primaryType]) {
-    if (version === SignTypedDataVersion.V3 && data[field.name] === undefined) {
-      continue;
-    }
-    const [type, value] = encodeField(
-      types,
-      field.name,
-      field.type,
-      data[field.name],
-      version,
-    );
-    encodedTypes.push(type);
-    encodedValues.push(value);
-  }
-
-  return arrToBufArr(encode(encodedTypes, encodedValues));
+  return encodeStruct(createDirectContext(types, version), primaryType, data);
 }
 
 /**
@@ -594,6 +796,451 @@ function eip712Hash<T extends MessageTypes>(
     );
   }
   return arrToBufArr(keccak256(concatBytes(parts)));
+}
+
+/**
+ * The version bound to a compiled {@link TypedDataPlan}. Only EIP-712 based
+ * versions (`V3` and `V4`) can be compiled; `V1` uses a different encoding and
+ * has no reusable type schema.
+ */
+export type CompiledVersion = SignTypedDataVersion.V3 | SignTypedDataVersion.V4;
+
+/**
+ * The options accepted by {@link compileTypedData}.
+ *
+ * @property types - The custom types used by the message.
+ * @property primaryType - The type of the message.
+ * @property version - The EIP-712 version the plan is bound to.
+ */
+export type CompileTypedDataOptions<T extends MessageTypes> = {
+  types: T;
+  primaryType: keyof T | string;
+  version: CompiledVersion;
+};
+
+/**
+ * The options accepted by {@link TypedDataPlan.execute}.
+ *
+ * @property domain - Signing domain metadata.
+ * @property message - The message to be signed.
+ * @property trace - Whether to return a safe trace of the encoding.
+ */
+export type ExecuteTypedDataOptions = {
+  domain?: Record<string, unknown>;
+  message?: Record<string, unknown>;
+  trace?: boolean;
+};
+
+/**
+ * The result of {@link TypedDataPlan.execute}.
+ *
+ * @property digest - The EIP-712 digest, as a `Buffer`.
+ * @property domainHash - The hash of the domain separator.
+ * @property messageHash - The hash of the message, if the primary type is not
+ * `EIP712Domain`.
+ * @property trace - The optional safe trace.
+ */
+export type TypedDataPlanResult = {
+  digest: Buffer;
+  domainHash: Buffer;
+  messageHash?: Buffer;
+  trace?: TypedDataTrace;
+};
+
+const NAME_REGEX = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
+const ARRAY_SUFFIX_REGEX = /\[(\d*)\]$/u;
+const NUMBER_TYPE_REGEX =
+  /^u?int(?:(8|16|24|32|40|48|56|64|72|80|88|96|104|112|120|128|136|144|152|160|168|176|184|192|200|208|216|224|232|240|248|256))?$/u;
+const FIXED_BYTES_TYPE_REGEX = /^bytes([1-9]|[12][0-9]|3[0-2])$/u;
+const ATOMIC_TYPES = new Set(['bool', 'address', 'bytes', 'string']);
+
+/**
+ * Strip the array suffix (including nested array suffixes) from a type.
+ *
+ * @param type - The type to strip the array suffix from.
+ * @returns The base type and whether the type is an array.
+ */
+function getBaseType(type: string): { baseType: string; isArray: boolean } {
+  let baseType = type;
+  let isArray = false;
+  while (ARRAY_SUFFIX_REGEX.test(baseType)) {
+    isArray = true;
+    baseType = baseType.replace(ARRAY_SUFFIX_REGEX, '');
+  }
+  return { baseType, isArray };
+}
+
+/**
+ * Validate that a field type is a valid Solidity-like type, as required by
+ * EIP-712. Struct references are validated separately against the declared
+ * types.
+ *
+ * Arrays (fixed or dynamic) of any valid type are accepted for `V4`. `V3`
+ * rejects arrays, matching its runtime encoding behaviour.
+ *
+ * @param name - The name of the field being validated.
+ * @param type - The declared type of the field.
+ * @param types - All declared struct types.
+ * @param version - The EIP-712 version the plan is bound to.
+ * @param path - The path of the struct containing the field.
+ */
+function validateFieldType(
+  name: string,
+  type: unknown,
+  types: Record<string, MessageTypeProperty[]>,
+  version: CompiledVersion,
+  path: string,
+): void {
+  if (typeof type !== 'string' || type.length === 0) {
+    throw new Error(
+      `Unable to compile typed data schema: Invalid type for field "${path}.${name}". Expected a non-empty Solidity-like type string, but received "${String(
+        type,
+      )}".`,
+    );
+  }
+
+  const { baseType, isArray } = getBaseType(type);
+
+  if (isArray && version === SignTypedDataVersion.V3) {
+    throw new Error('Arrays are unimplemented in encodeData; use V4 extension');
+  }
+
+  if (baseType === 'function') {
+    throw new Error('Unsupported or invalid type: "function"');
+  }
+
+  if (types[baseType] !== undefined) {
+    return;
+  }
+
+  if (
+    ATOMIC_TYPES.has(baseType) ||
+    NUMBER_TYPE_REGEX.test(baseType) ||
+    FIXED_BYTES_TYPE_REGEX.test(baseType)
+  ) {
+    return;
+  }
+
+  throw new Error(
+    `Unable to compile typed data schema: No type definition specified: ${baseType} (referenced by field "${path}.${name}" of type "${type}").`,
+  );
+}
+
+/**
+ * Validate a single struct definition.
+ *
+ * @param name - The name of the struct.
+ * @param fields - The declared fields of the struct.
+ * @param types - All declared struct types.
+ * @param version - The EIP-712 version the plan is bound to.
+ */
+function validateStruct(
+  name: string,
+  fields: unknown,
+  types: Record<string, MessageTypeProperty[]>,
+  version: CompiledVersion,
+): void {
+  if (!Array.isArray(fields)) {
+    throw new Error(
+      `Unable to compile typed data schema: Type "${name}" must be an array of { name, type } fields, but received "${typeof fields}".`,
+    );
+  }
+
+  const seenFields = new Set<string>();
+
+  for (const field of fields) {
+    if (
+      typeof field !== 'object' ||
+      field === null ||
+      typeof (field as MessageTypeProperty).name !== 'string' ||
+      typeof (field as MessageTypeProperty).type !== 'string'
+    ) {
+      throw new Error(
+        `Unable to compile typed data schema: Every field of type "${name}" must be an object with a string "name" and a string "type".`,
+      );
+    }
+
+    const { name: fieldName, type: fieldType } = field as MessageTypeProperty;
+
+    if (!NAME_REGEX.test(fieldName)) {
+      throw new Error(
+        `Unable to compile typed data schema: Invalid field name "${fieldName}" on type "${name}". Field names must be non-empty valid identifiers.`,
+      );
+    }
+
+    if (seenFields.has(fieldName)) {
+      throw new Error(
+        `Unable to compile typed data schema: Duplicate field name "${fieldName}" on type "${name}".`,
+      );
+    }
+    seenFields.add(fieldName);
+
+    validateFieldType(fieldName, fieldType, types, version, name);
+  }
+}
+
+/**
+ * Compile a field descriptor from a declared field.
+ *
+ * @param field - The declared field.
+ * @param types - All declared struct types.
+ * @returns The immutable field descriptor.
+ */
+function compileFieldDescriptor(
+  field: MessageTypeProperty,
+  types: Record<string, MessageTypeProperty[]>,
+): FieldDescriptor {
+  const { baseType, isArray } = getBaseType(field.type);
+  return {
+    name: field.name,
+    type: field.type,
+    array: isArray,
+    arrayBaseType: isArray
+      ? field.type.slice(0, field.type.lastIndexOf('['))
+      : undefined,
+    structType: types[baseType] === undefined ? undefined : baseType,
+  };
+}
+
+/**
+ * Compile an immutable, reusable plan for a typed data schema. Compilation
+ * validates the primary type, the dependency graph, field names and
+ * Solidity-like types, and precomputes the `encodeType` string, type hash and
+ * per-field encoder of every struct reachable from the primary type and the
+ * domain separator.
+ *
+ * The resulting plan is bound to the given EIP-712 version, holds no message
+ * values, and can be reused concurrently for different messages.
+ */
+export class TypedDataPlan {
+  readonly version: CompiledVersion;
+
+  readonly primaryType: string;
+
+  readonly types: Record<string, MessageTypeProperty[]>;
+
+  readonly #descriptors: Map<string, StructDescriptor>;
+
+  /**
+   * Compile a typed data schema into a plan.
+   *
+   * @param options - The compilation options.
+   * @param options.types - The custom types used by the message.
+   * @param options.primaryType - The type of the message.
+   * @param options.version - The EIP-712 version the plan is bound to.
+   * @returns The immutable compiled plan.
+   */
+  static compile<T extends MessageTypes>({
+    types,
+    primaryType,
+    version,
+  }: CompileTypedDataOptions<T>): TypedDataPlan {
+    validateVersion(version, [
+      SignTypedDataVersion.V3,
+      SignTypedDataVersion.V4,
+    ]);
+
+    if (typeof primaryType !== 'string' || primaryType.length === 0) {
+      throw new Error(
+        `Unable to compile typed data schema: Invalid primary type. Expected a non-empty type name, but received "${String(
+          primaryType,
+        )}".`,
+      );
+    }
+
+    if (typeof types !== 'object' || types === null) {
+      throw new Error(
+        'Unable to compile typed data schema: Expected an object mapping type names to field arrays.',
+      );
+    }
+
+    const normalizedTypes: Record<string, MessageTypeProperty[]> = {
+      EIP712Domain: [],
+      ...(types as Record<string, MessageTypeProperty[]>),
+    };
+
+    for (const [name, fields] of Object.entries(normalizedTypes)) {
+      validateStruct(name, fields, normalizedTypes, version);
+    }
+
+    if (normalizedTypes[primaryType] === undefined) {
+      throw new Error(`No type definition specified: ${primaryType}`);
+    }
+
+    const reachable = new Set<string>();
+    for (const rootType of ['EIP712Domain', primaryType]) {
+      for (const dependency of findTypeDependencies(
+        rootType,
+        normalizedTypes,
+      )) {
+        reachable.add(dependency);
+      }
+    }
+
+    const descriptors = new Map<string, StructDescriptor>();
+    for (const name of reachable) {
+      const encodedType = encodeType(name, normalizedTypes);
+      const fields = normalizedTypes[name].map((field) =>
+        compileFieldDescriptor(field, normalizedTypes),
+      );
+      descriptors.set(name, {
+        fields,
+        encodeType: encodedType,
+        typeHash: arrToBufArr(keccak256(stringToBytes(encodedType))),
+      });
+    }
+
+    return new TypedDataPlan(
+      version,
+      primaryType,
+      normalizedTypes,
+      descriptors,
+    );
+  }
+
+  constructor(
+    version: CompiledVersion,
+    primaryType: string,
+    types: Record<string, MessageTypeProperty[]>,
+    descriptors: Map<string, StructDescriptor>,
+  ) {
+    this.version = version;
+    this.primaryType = primaryType;
+    this.types = types;
+    this.#descriptors = descriptors;
+    Object.freeze(this);
+  }
+
+  /**
+   * Get the `encodeType` string of a struct reachable from this plan.
+   *
+   * @param type - The struct type name.
+   * @returns The `encodeType` string.
+   */
+  encodeType(type: string): string {
+    return this.#getDescriptor(type).encodeType;
+  }
+
+  /**
+   * Get the type hash of a struct reachable from this plan.
+   *
+   * @param type - The struct type name.
+   * @returns The type hash.
+   */
+  typeHash(type: string): Buffer {
+    return this.#getDescriptor(type).typeHash;
+  }
+
+  /**
+   * Hash a single struct value against this plan.
+   *
+   * @param type - The struct type name.
+   * @param value - The struct value.
+   * @returns The struct hash.
+   */
+  hashStruct(type: string, value: Record<string, unknown>): Buffer {
+    return this.#executeStruct(type, value ?? {}).structHash;
+  }
+
+  /**
+   * Execute the plan against a concrete domain and message. The plan itself is
+   * never mutated and the provided values are not retained.
+   *
+   * @param options - The execution options.
+   * @param options.domain - Signing domain metadata.
+   * @param options.message - The message to be signed.
+   * @param options.trace - Whether to return a safe trace of the encoding.
+   * @returns The EIP-712 digest and optional safe trace.
+   */
+  execute({
+    domain = {},
+    message,
+    trace: includeTrace = false,
+  }: ExecuteTypedDataOptions = {}): TypedDataPlanResult {
+    const trace: TypedDataTrace = { structs: [] };
+
+    const domainExecution = this.#executeStruct('EIP712Domain', domain, trace);
+    trace.domainHash = domainExecution.traceEntry;
+    const domainHash = domainExecution.structHash;
+
+    let messageHash: Buffer | undefined;
+    if (this.primaryType !== 'EIP712Domain') {
+      if (message === undefined || message === null) {
+        throw new Error(
+          `Unable to encode value: Missing message of primary type "${this.primaryType}".`,
+        );
+      }
+
+      const messageExecution = this.#executeStruct(
+        this.primaryType,
+        message,
+        trace,
+      );
+      trace.messageHash = messageExecution.traceEntry;
+      messageHash = messageExecution.structHash;
+    }
+
+    const parts = [hexToBytes('1901'), domainHash];
+    if (messageHash !== undefined) {
+      parts.push(messageHash);
+    }
+    const digest = arrToBufArr(keccak256(concatBytes(parts)));
+
+    return includeTrace
+      ? { digest, domainHash, messageHash, trace }
+      : { digest, domainHash, messageHash };
+  }
+
+  #getDescriptor(type: string): StructDescriptor {
+    const descriptor = this.#descriptors.get(type);
+    if (!descriptor) {
+      throw new Error(`No type definition specified: ${type}`);
+    }
+    return descriptor;
+  }
+
+  #executeStruct(
+    type: string,
+    value: Record<string, unknown>,
+    trace?: TypedDataTrace,
+  ): { structHash: Buffer; traceEntry: StructTraceEntry } {
+    const structTraces: StructTraceEntry[] = [];
+    const context: EncodingContext = {
+      version: this.version,
+      getStruct: (name) => this.types[name],
+      getStructDescriptor: (name) => this.#getDescriptor(name),
+      getTypeHash: (name) => this.#getDescriptor(name).typeHash,
+      detectCycles: true,
+      activeStructs: new Map(),
+      trace: structTraces,
+    };
+
+    const encoded = encodeStruct(context, type, value);
+    const structHash = arrToBufArr(keccak256(encoded));
+    const traceEntry = structTraces[structTraces.length - 1] ?? {
+      type,
+      typeHash: this.#getDescriptor(type).typeHash,
+      structHash,
+    };
+
+    if (trace) {
+      trace.structs.push(...structTraces);
+    }
+
+    return { structHash, traceEntry };
+  }
+}
+
+/**
+ * Compile a typed data schema into an immutable {@link TypedDataPlan}.
+ *
+ * @param options - The compilation options.
+ * @returns The compiled plan.
+ */
+export function compileTypedData<T extends MessageTypes>(
+  options: CompileTypedDataOptions<T>,
+): TypedDataPlan {
+  return TypedDataPlan.compile(options);
 }
 
 /**
